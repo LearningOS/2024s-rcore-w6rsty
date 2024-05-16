@@ -14,14 +14,41 @@ mod switch;
 #[allow(clippy::module_inception)]
 mod task;
 
-use crate::config::MAX_APP_NUM;
+use crate::config::{MAX_APP_NUM, MAX_SYSCALL_NUM};
 use crate::loader::{get_num_app, init_app_cx};
 use crate::sync::UPSafeCell;
+use crate::timer::get_time_ms;
 use lazy_static::*;
 use switch::__switch;
 pub use task::{TaskControlBlock, TaskStatus};
 
 pub use context::TaskContext;
+
+struct SyscallCounter {
+    current_task: usize,
+    times: [[u32; MAX_SYSCALL_NUM]; MAX_APP_NUM]
+}
+
+impl SyscallCounter {
+    fn new() -> Self {
+        SyscallCounter {
+            current_task: 0,
+            times: [[0; MAX_SYSCALL_NUM]; MAX_APP_NUM]
+        }
+    }
+
+    fn switch_task(&mut self, task_id: usize) {
+        self.current_task = task_id;
+    }
+
+    fn increase(&mut self, id: usize) {
+        self.times[self.current_task][id] += 1;
+    }
+
+    fn get_syscall_times(&self, task_id: usize) -> [u32; MAX_SYSCALL_NUM] {
+        self.times[task_id]
+    }
+}
 
 /// The task manager, where all the tasks are managed.
 ///
@@ -37,6 +64,8 @@ pub struct TaskManager {
     num_app: usize,
     /// use inner value to get mutable access
     inner: UPSafeCell<TaskManagerInner>,
+    /// syscall counter
+    syscall_counter: UPSafeCell<SyscallCounter>,
 }
 
 /// Inner of Task Manager
@@ -54,6 +83,7 @@ lazy_static! {
         let mut tasks = [TaskControlBlock {
             task_cx: TaskContext::zero_init(),
             task_status: TaskStatus::UnInit,
+            start_time: get_time_ms(),
         }; MAX_APP_NUM];
         for (i, task) in tasks.iter_mut().enumerate() {
             task.task_cx = TaskContext::goto_restore(init_app_cx(i));
@@ -66,6 +96,9 @@ lazy_static! {
                     tasks,
                     current_task: 0,
                 })
+            },
+            syscall_counter: unsafe {
+                UPSafeCell::new(SyscallCounter::new())
             },
         }
     };
@@ -120,11 +153,13 @@ impl TaskManager {
     fn run_next_task(&self) {
         if let Some(next) = self.find_next_task() {
             let mut inner = self.inner.exclusive_access();
+            let mut counter = self.syscall_counter.exclusive_access();
             let current = inner.current_task;
             inner.tasks[next].task_status = TaskStatus::Running;
             inner.current_task = next;
             let current_task_cx_ptr = &mut inner.tasks[current].task_cx as *mut TaskContext;
             let next_task_cx_ptr = &inner.tasks[next].task_cx as *const TaskContext;
+            counter.switch_task(next);
             drop(inner);
             // before this, we should drop local variables that must be dropped manually
             unsafe {
@@ -135,6 +170,26 @@ impl TaskManager {
             panic!("All applications completed!");
         }
     }
+
+    /// Get current task
+    fn get_current_task_tcb(&self) -> TaskControlBlock {
+        let inner = self.inner.exclusive_access();
+        let counter = self.syscall_counter.exclusive_access();
+        inner.tasks[counter.current_task]
+    }
+    
+    /// Get current task's syscall times from counter
+    fn get_current_task_syscall_times(&self) -> [u32; MAX_SYSCALL_NUM] {
+        let counter = self.syscall_counter.exclusive_access();
+        counter.get_syscall_times(counter.current_task)
+    }
+
+    /// Increase current task's syscall count
+    fn increase_current_task_syscall_count(&self, id: usize) {
+        let mut counter = self.syscall_counter.exclusive_access();
+        counter.increase(id);
+    }
+
 }
 
 /// Run the first task in task list.
@@ -168,4 +223,19 @@ pub fn suspend_current_and_run_next() {
 pub fn exit_current_and_run_next() {
     mark_current_exited();
     run_next_task();
+}
+
+/// Get current task
+pub fn get_current_task_tcb() -> TaskControlBlock {
+    TASK_MANAGER.get_current_task_tcb()
+}
+
+/// Get current task's syscall times
+pub fn get_current_task_syscall_times() -> [u32; MAX_SYSCALL_NUM] {
+    TASK_MANAGER.get_current_task_syscall_times()
+}
+
+/// Increase current task's syscall count
+pub fn increase_current_task_syscall_count(id: usize) {
+    TASK_MANAGER.increase_current_task_syscall_count(id);
 }
